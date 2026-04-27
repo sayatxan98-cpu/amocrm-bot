@@ -55,7 +55,7 @@ _rr_index = 0
 def amo_headers():
     return {
         "Authorization": f"Bearer {AMO_TOKEN}",
-        "Content-Type": "application/json",
+        "Content-Type": "application/json; charset=utf-8",
     }
 
 def next_manager():
@@ -136,7 +136,7 @@ def whatsapp(phone, text):
         },
         headers={
             "Authorization": f"Bearer {WAZZUP_API_KEY}",
-            "Content-Type": "application/json",
+            "Content-Type": "application/json; charset=utf-8",
         },
         timeout=10,
     )
