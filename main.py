@@ -41,11 +41,11 @@ def http(method, url, data=None, extra_headers=None):
     try:
         with urllib.request.urlopen(req, timeout=10) as r:
             raw = r.read().decode("utf-8")
-            print(f"[{method}] {url} -> {r.status} {raw[:200]}", flush=True)
+            print(f"[{method}] {url} -> {r.status}", flush=True)
             return json.loads(raw) if raw else {}
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8")
-        print(f"[ERROR] {method} {url} -> {e.code} {body}", flush=True)
+        print(f"[ERROR] {method} {url} -> {e.code} {body[:200]}", flush=True)
         return {}
     except Exception as ex:
         print(f"[EXCEPTION] {method} {url} -> {ex}", flush=True)
@@ -80,9 +80,22 @@ def get_phone(lead_data):
     return None
 
 
+def close_open_tasks(lead_id):
+    """Закрыть все открытые задачи по сделке."""
+    print(f"[CLOSE TASKS] lead_id={lead_id}", flush=True)
+    r = amo("GET", f"/api/v4/tasks?filter[entity_id]={lead_id}&filter[is_completed]=0&limit=50")
+    tasks = r.get("_embedded", {}).get("tasks", [])
+    if not tasks:
+        print(f"[CLOSE TASKS] No open tasks found", flush=True)
+        return
+    patch_data = [{"id": t["id"], "is_completed": True} for t in tasks]
+    amo("PATCH", "/api/v4/tasks", patch_data)
+    print(f"[CLOSE TASKS] Closed {len(tasks)} tasks", flush=True)
+
+
 def create_task(lead_id, user_id, text, minutes):
     due = int((datetime.datetime.now() + datetime.timedelta(minutes=minutes)).timestamp())
-    print(f"[TASK] Creating for lead={lead_id} user={user_id} text={text}", flush=True)
+    print(f"[TASK] Creating: lead={lead_id} text={text}", flush=True)
     amo("POST", "/api/v4/tasks", [{
         "task_type_id": 1,
         "text": text,
@@ -99,7 +112,6 @@ def assign_lead(lead_id, user_id):
 
 def send_wa(phone, text):
     if not phone:
-        print("[WA] No phone, skipping", flush=True)
         return
     print(f"[WA] Sending to {phone}", flush=True)
     http("POST", "https://api.wazzup24.com/v3/message", {
@@ -122,6 +134,7 @@ def on_new_lead(lead_id, d):
     m = next_manager()
     p = get_phone(d)
     assign_lead(lead_id, m["amo_id"])
+    close_open_tasks(lead_id)
     create_task(lead_id, m["amo_id"], "Call new lead - 5 min", 5)
     send_wa(p, "Hello! We received your request. Our manager will call you back shortly.")
 
@@ -130,6 +143,7 @@ def on_no_answer(lead_id, d):
     print(f"[NO ANSWER] lead_id={lead_id}", flush=True)
     u = d.get("responsible_user_id")
     p = get_phone(d)
+    close_open_tasks(lead_id)
     create_task(lead_id, u, "Call back - no answer - 2h", 120)
     send_wa(p, "Hello! We tried to reach you. Please let us know a convenient time!")
 
@@ -138,6 +152,7 @@ def on_callback_later(lead_id, d, mins=60):
     print(f"[CALLBACK LATER] lead_id={lead_id}", flush=True)
     u = d.get("responsible_user_id")
     p = get_phone(d)
+    close_open_tasks(lead_id)
     create_task(lead_id, u, "Call back - client asked later", mins)
     if mins > 15:
         later_wa((mins - 15) * 60, p, "Reminder: our manager will call you in 15 minutes.")
@@ -145,13 +160,16 @@ def on_callback_later(lead_id, d, mins=60):
 
 def on_in_work(lead_id, d):
     print(f"[IN WORK] lead_id={lead_id}", flush=True)
-    create_task(lead_id, d.get("responsible_user_id"), "Send commercial offer - 1h", 60)
+    u = d.get("responsible_user_id")
+    close_open_tasks(lead_id)
+    create_task(lead_id, u, "Send commercial offer - 1h", 60)
 
 
 def on_deciding(lead_id, d):
     print(f"[DECIDING] lead_id={lead_id}", flush=True)
     u = d.get("responsible_user_id")
     p = get_phone(d)
+    close_open_tasks(lead_id)
     create_task(lead_id, u, "Follow up on offer - 1 day", 1440)
     later_wa(7200, p, "Hello! We sent you our offer. Any questions? Feel free to reach out!")
 
@@ -160,6 +178,7 @@ def on_contract(lead_id, d):
     print(f"[CONTRACT] lead_id={lead_id}", flush=True)
     u = d.get("responsible_user_id")
     p = get_phone(d)
+    close_open_tasks(lead_id)
     create_task(lead_id, u, "Check contract signing - 1 day", 1440)
     send_wa(p, "The contract has been sent. Let us know if you have any questions!")
 
@@ -168,6 +187,7 @@ def on_success(lead_id, d):
     print(f"[SUCCESS] lead_id={lead_id}", flush=True)
     u = d.get("responsible_user_id")
     p = get_phone(d)
+    close_open_tasks(lead_id)
     create_task(lead_id, u, "Request review - 7 days", 10080)
     later_wa(259200, p,
         "Hello! Hope everything went great!\n\n"
@@ -188,7 +208,6 @@ STAGE_MAP = {
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.form.to_dict(flat=False)
-    print(f"[WEBHOOK] data keys: {list(data.keys())}", flush=True)
 
     ids = data.get("leads[add][0][id]")
     if ids:
