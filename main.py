@@ -1,6 +1,5 @@
 from flask import Flask, request
 import urllib.request
-import urllib.parse
 import json, datetime, threading, time, os
 
 app = Flask(__name__)
@@ -30,22 +29,31 @@ _rr_lock  = threading.Lock()
 _rr_index = 0
 
 
-def http(method, url, data=None, headers=None):
+def http(method, url, data=None, extra_headers=None):
     body = json.dumps(data, ensure_ascii=False).encode("utf-8") if data is not None else None
-    h = {"Content-Type": "application/json"}
-    if headers:
-        h.update(headers)
-    req = urllib.request.Request(url, data=body, headers=h, method=method)
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {AMO_TOKEN}",
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+    req = urllib.request.Request(url, data=body, headers=headers, method=method)
     try:
         with urllib.request.urlopen(req, timeout=10) as r:
-            return json.loads(r.read().decode("utf-8"))
-    except Exception:
+            raw = r.read().decode("utf-8")
+            print(f"[{method}] {url} -> {r.status} {raw[:200]}", flush=True)
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8")
+        print(f"[ERROR] {method} {url} -> {e.code} {body}", flush=True)
+        return {}
+    except Exception as ex:
+        print(f"[EXCEPTION] {method} {url} -> {ex}", flush=True)
         return {}
 
 
 def amo(method, path, data=None):
-    return http(method, f"https://{AMO_DOMAIN}{path}", data,
-                {"Authorization": f"Bearer {AMO_TOKEN}"})
+    return http(method, f"https://{AMO_DOMAIN}{path}", data)
 
 
 def next_manager():
@@ -67,13 +75,14 @@ def get_phone(lead_data):
         for f in c.get("custom_fields_values") or []:
             if f["field_code"] == "PHONE":
                 return "".join(x for x in f["values"][0]["value"] if x.isdigit())
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[PHONE ERROR] {e}", flush=True)
     return None
 
 
 def create_task(lead_id, user_id, text, minutes):
     due = int((datetime.datetime.now() + datetime.timedelta(minutes=minutes)).timestamp())
+    print(f"[TASK] Creating for lead={lead_id} user={user_id} text={text}", flush=True)
     amo("POST", "/api/v4/tasks", [{
         "task_type_id": 1,
         "text": text,
@@ -90,7 +99,9 @@ def assign_lead(lead_id, user_id):
 
 def send_wa(phone, text):
     if not phone:
+        print("[WA] No phone, skipping", flush=True)
         return
+    print(f"[WA] Sending to {phone}", flush=True)
     http("POST", "https://api.wazzup24.com/v3/message", {
         "channelId": WAZZUP_CHANNEL_ID,
         "chatType": "whatsapp",
@@ -107,6 +118,7 @@ def later_wa(sec, phone, text):
 
 
 def on_new_lead(lead_id, d):
+    print(f"[NEW LEAD] lead_id={lead_id}", flush=True)
     m = next_manager()
     p = get_phone(d)
     assign_lead(lead_id, m["amo_id"])
@@ -115,45 +127,51 @@ def on_new_lead(lead_id, d):
 
 
 def on_no_answer(lead_id, d):
+    print(f"[NO ANSWER] lead_id={lead_id}", flush=True)
     u = d.get("responsible_user_id")
     p = get_phone(d)
     create_task(lead_id, u, "Call back - no answer - 2h", 120)
-    send_wa(p, "Hello! We tried to reach you. Please let us know a convenient time to call back!")
+    send_wa(p, "Hello! We tried to reach you. Please let us know a convenient time!")
 
 
 def on_callback_later(lead_id, d, mins=60):
+    print(f"[CALLBACK LATER] lead_id={lead_id}", flush=True)
     u = d.get("responsible_user_id")
     p = get_phone(d)
     create_task(lead_id, u, "Call back - client asked later", mins)
     if mins > 15:
-        later_wa((mins - 15) * 60, p, "Reminder: our manager will call you in about 15 minutes.")
+        later_wa((mins - 15) * 60, p, "Reminder: our manager will call you in 15 minutes.")
 
 
 def on_in_work(lead_id, d):
+    print(f"[IN WORK] lead_id={lead_id}", flush=True)
     create_task(lead_id, d.get("responsible_user_id"), "Send commercial offer - 1h", 60)
 
 
 def on_deciding(lead_id, d):
+    print(f"[DECIDING] lead_id={lead_id}", flush=True)
     u = d.get("responsible_user_id")
     p = get_phone(d)
     create_task(lead_id, u, "Follow up on offer - 1 day", 1440)
-    later_wa(7200, p, "Hello! We sent you our commercial offer. Any questions? Feel free to reach out!")
+    later_wa(7200, p, "Hello! We sent you our offer. Any questions? Feel free to reach out!")
 
 
 def on_contract(lead_id, d):
+    print(f"[CONTRACT] lead_id={lead_id}", flush=True)
     u = d.get("responsible_user_id")
     p = get_phone(d)
     create_task(lead_id, u, "Check contract signing - 1 day", 1440)
-    send_wa(p, "The contract has been sent for your review. Let us know if you have any questions!")
+    send_wa(p, "The contract has been sent. Let us know if you have any questions!")
 
 
 def on_success(lead_id, d):
+    print(f"[SUCCESS] lead_id={lead_id}", flush=True)
     u = d.get("responsible_user_id")
     p = get_phone(d)
     create_task(lead_id, u, "Request review - 7 days", 10080)
     later_wa(259200, p,
         "Hello! Hope everything went great!\n\n"
-        "We have a bonus for you: recommend us to a friend and get a gift from our company!"
+        "Recommend us to a friend and get a gift from our company!"
     )
 
 
@@ -170,22 +188,31 @@ STAGE_MAP = {
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.form.to_dict(flat=False)
+    print(f"[WEBHOOK] data keys: {list(data.keys())}", flush=True)
+
     ids = data.get("leads[add][0][id]")
     if ids:
         lid = int(ids[0])
+        print(f"[WEBHOOK] New lead: {lid}", flush=True)
         ld = get_lead(lid)
         if ld:
             threading.Thread(target=on_new_lead, args=(lid, ld), daemon=True).start()
         return "ok", 200
+
     ir = data.get("leads[status][0][id]")
     sr = data.get("leads[status][0][status_id]")
     if ir and sr:
         lid = int(ir[0])
-        h = STAGE_MAP.get(sr[0])
+        sid = sr[0]
+        print(f"[WEBHOOK] Status change: lead={lid} status={sid}", flush=True)
+        h = STAGE_MAP.get(sid)
         if h:
             ld = get_lead(lid)
             if ld:
                 threading.Thread(target=h, args=(lid, ld), daemon=True).start()
+        else:
+            print(f"[WEBHOOK] No handler for status {sid}", flush=True)
+
     return "ok", 200
 
 
